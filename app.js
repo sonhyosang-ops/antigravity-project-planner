@@ -1,0 +1,1731 @@
+import * as Y from 'https://esm.sh/yjs@13.6.10';
+import { WebsocketProvider } from 'https://esm.sh/y-websocket@3.0.0?deps=yjs@13.6.10';
+import { IndexeddbPersistence } from 'https://esm.sh/y-indexeddb@9.0.12?deps=yjs@13.6.10';
+
+/* ==========================================================================
+   State & Global Variables
+   ========================================================================== */
+let ydoc = null;
+let provider = null;
+let persistence = null;
+
+// Yjs Shared Types
+let sharedMap = null;         // For single inputs and settings
+let checkboxMap = null;       // For checkbox boolean states
+let lessonsArray = null;      // Y.Array of Y.Map for collaborative lessons
+let rolesArray = null;        // Y.Array of Y.Map for collaborative roles
+let sharedHistoryArray = null;// Y.Array of snapshots for version history
+
+// Local bindings tracking to prevent leaks and duplication
+let activeBindings = new Map();
+let currentRoomId = 'ai-project-room';
+
+// Local user profile state
+let localNickname = '';
+let localColor = '';
+
+// Central WebSocket sync server (Google Docs client-server architecture)
+const WEBSOCKET_SERVER = 'wss://demos.yjs.dev';
+
+// Pastel colors list for user cursors and avatars
+const USER_COLORS = [
+    '#3b82f6', // blue
+    '#10b981', // green
+    '#f59e0b', // amber
+    '#ef4444', // red
+    '#8b5cf6', // purple
+    '#ec4899', // pink
+    '#06b6d4', // cyan
+    '#84cc16', // lime
+    '#f97316', // orange
+    '#14b8a6', // teal
+    '#6366f1'  // indigo
+];
+
+// Profile generation arrays
+const ADJECTIVES = ['지혜로운', '창의적인', '열정적인', '꿈꾸는', '다정한', '탐구하는', '실천하는', '도전하는', '빛나는', '협력하는'];
+const NOUNS = ['선생님', '연구원', '학습자', '설계자', '길잡이', '크리에이터', '기획자', '멘토', '퍼실리테이터'];
+
+// Auto-save debounce timer
+let saveTimeout = null;
+let isSyncing = false; // Flag to prevent cyclic updates during sync operations
+
+/* ==========================================================================
+   DOM Elements
+   ========================================================================== */
+const tabButtons = document.querySelectorAll('.tab-btn');
+const sections = document.querySelectorAll('.document-section');
+const themeToggle = document.getElementById('theme-toggle');
+const printBtn = document.getElementById('print-btn');
+const exportJsonBtn = document.getElementById('export-json-btn');
+const importJsonTrigger = document.getElementById('import-json-trigger');
+const importJsonFile = document.getElementById('import-json-file');
+const lessonTbody = document.getElementById('lesson-tbody');
+const roleTbody = document.getElementById('role-tbody');
+const addLessonBtn = document.getElementById('add-lesson-btn');
+const addRoleBtn = document.getElementById('add-role-btn');
+
+// Sidebar DOM Elements
+const historyToggleBtn = document.getElementById('history-toggle-btn');
+const historySidebar = document.getElementById('history-sidebar');
+const closeHistoryBtn = document.getElementById('close-history-btn');
+const saveVersionBtn = document.getElementById('save-version-btn');
+const historyList = document.getElementById('history-list');
+const historyAuthorInput = document.getElementById('history-author');
+const historyNoteInput = document.getElementById('history-note');
+
+// Sync & Co-viewing DOM Elements
+const pushStateBtn = document.getElementById('push-state-btn');
+const saveStatusText = document.getElementById('save-status-text');
+const tabSyncCheckbox = document.getElementById('tab-sync-checkbox');
+const currentRoomNameEl = document.getElementById('current-room-name');
+const shareBtn = document.getElementById('share-btn');
+const collabUsersList = document.getElementById('collab-users-list');
+const connectionStatus = document.getElementById('connection-status');
+
+// Modals DOM Elements
+const dashboardBtn = document.getElementById('dashboard-btn');
+const dashboardModal = document.getElementById('dashboard-modal');
+const closeDashboardBtn = document.getElementById('close-dashboard-btn');
+const btnNewDoc = document.getElementById('btn-new-doc');
+const dashboardRoomInput = document.getElementById('dashboard-room-input');
+const btnJoinRoom = document.getElementById('btn-join-room');
+const recentDocsList = document.getElementById('recent-docs-list');
+
+const userProfileBtn = document.getElementById('user-profile-btn');
+const profileModal = document.getElementById('profile-modal');
+const closeProfileBtn = document.getElementById('close-profile-btn');
+const profileNicknameInput = document.getElementById('profile-nickname');
+const profileColorsGrid = document.getElementById('profile-colors-grid');
+const profileSaveBtn = document.getElementById('profile-save-btn');
+
+/* ==========================================================================
+   Helper Functions
+   ========================================================================== */
+function escapeHtml(text) {
+    if (!text) return '';
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+function showSavingStatus() {
+    if (pushStateBtn && saveStatusText) {
+        pushStateBtn.classList.add('saving');
+        pushStateBtn.classList.remove('saved');
+        saveStatusText.textContent = '저장 중...';
+    }
+    
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+        showSavedStatus();
+    }, 800);
+}
+
+function showSavedStatus() {
+    if (pushStateBtn && saveStatusText) {
+        pushStateBtn.classList.remove('saving');
+        pushStateBtn.classList.add('saved');
+        saveStatusText.textContent = '저장 완료';
+    }
+}
+
+/* ==========================================================================
+   Textarea Auto-grow Logic
+   ========================================================================== */
+function autoGrowTextarea(element) {
+    if (!element) return;
+    element.style.height = 'auto';
+    element.style.height = (element.scrollHeight) + 'px';
+}
+
+function initAutoGrow() {
+    const textareas = document.querySelectorAll('textarea.auto-grow');
+    textareas.forEach(textarea => {
+        autoGrowTextarea(textarea);
+        if (!textarea.dataset.autogrowBound) {
+            textarea.addEventListener('input', () => autoGrowTextarea(textarea));
+            textarea.dataset.autogrowBound = 'true';
+        }
+    });
+}
+window.addEventListener('resize', initAutoGrow);
+
+/* ==========================================================================
+   Tab Navigation
+   ========================================================================== */
+function switchTabTo(tabId) {
+    const btn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+    if (btn && !btn.classList.contains('active')) {
+        tabButtons.forEach(b => b.classList.remove('active'));
+        sections.forEach(s => s.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById(tabId).classList.add('active');
+        initAutoGrow();
+    }
+}
+
+tabButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+        const targetTab = btn.getAttribute('data-tab');
+        switchTabTo(targetTab);
+        
+        // Tab Co-viewing Sync: propagate current tab selection
+        const isTabSyncEnabled = tabSyncCheckbox && tabSyncCheckbox.checked;
+        if (isTabSyncEnabled && sharedMap && !isSyncing) {
+            sharedMap.set('current-tab', targetTab);
+        }
+    });
+});
+
+/* ==========================================================================
+   Theme Management (Dark/Light)
+   ========================================================================== */
+function initTheme() {
+    const savedTheme = localStorage.getItem('theme') || 'light';
+    if (savedTheme === 'dark') {
+        document.body.classList.add('dark-mode');
+        themeToggle.innerHTML = '<i class="fa-solid fa-sun"></i>';
+    } else {
+        document.body.classList.remove('dark-mode');
+        themeToggle.innerHTML = '<i class="fa-solid fa-moon"></i>';
+    }
+}
+
+themeToggle.addEventListener('click', () => {
+    document.body.classList.toggle('dark-mode');
+    const isDark = document.body.classList.contains('dark-mode');
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    themeToggle.innerHTML = isDark ? '<i class="fa-solid fa-sun"></i>' : '<i class="fa-solid fa-moon"></i>';
+});
+
+// Sidebar Open/Close handlers
+historyToggleBtn.addEventListener('click', () => {
+    historySidebar.classList.toggle('active');
+    document.body.classList.toggle('sidebar-open');
+});
+
+closeHistoryBtn.addEventListener('click', () => {
+    historySidebar.classList.remove('active');
+    document.body.classList.remove('sidebar-open');
+});
+
+/* ==========================================================================
+   Modals Display Management
+   ========================================================================== */
+function openModal(modal) {
+    modal.classList.add('active');
+}
+
+function closeModal(modal) {
+    modal.classList.remove('active');
+}
+
+// Bind modal toggles
+dashboardBtn.addEventListener('click', () => {
+    renderRecentDocsList();
+    openModal(dashboardModal);
+});
+closeDashboardBtn.addEventListener('click', () => closeModal(dashboardModal));
+window.addEventListener('click', (e) => {
+    if (e.target === dashboardModal) closeModal(dashboardModal);
+    if (e.target === profileModal) closeModal(profileModal);
+});
+
+userProfileBtn.addEventListener('click', () => {
+    profileNicknameInput.value = localNickname;
+    renderProfileColorsSelection();
+    openModal(profileModal);
+});
+closeProfileBtn.addEventListener('click', () => closeModal(profileModal));
+
+/* ==========================================================================
+   User Profile Management (Nickname & Cursors Color)
+   ========================================================================== */
+function loadUserProfile() {
+    localNickname = localStorage.getItem('ai_collab_nickname');
+    localColor = localStorage.getItem('ai_collab_color');
+    
+    if (!localNickname) {
+        const randAdj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+        const randNoun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
+        localNickname = `${randAdj} ${randNoun}`;
+        localStorage.setItem('ai_collab_nickname', localNickname);
+    }
+    
+    if (!localColor) {
+        localColor = USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)];
+        localStorage.setItem('ai_collab_color', localColor);
+    }
+
+    if (historyAuthorInput && !historyAuthorInput.value) {
+        historyAuthorInput.value = localNickname;
+    }
+}
+
+function renderProfileColorsSelection() {
+    profileColorsGrid.innerHTML = '';
+    USER_COLORS.forEach(color => {
+        const option = document.createElement('div');
+        option.className = 'color-option';
+        option.style.backgroundColor = color;
+        if (color === localColor) {
+            option.classList.add('selected');
+        }
+        option.addEventListener('click', () => {
+            document.querySelectorAll('.color-option').forEach(el => el.classList.remove('selected'));
+            option.classList.add('selected');
+            localColor = color;
+        });
+        profileColorsGrid.appendChild(option);
+    });
+}
+
+profileSaveBtn.addEventListener('click', () => {
+    const nick = profileNicknameInput.value.trim();
+    if (!nick) {
+        alert('닉네임을 입력해 주세요.');
+        return;
+    }
+    localNickname = nick;
+    localStorage.setItem('ai_collab_nickname', localNickname);
+    localStorage.setItem('ai_collab_color', localColor);
+    
+    // Broadcast updated profile info via Yjs Awareness
+    if (provider && provider.awareness) {
+        provider.awareness.setLocalStateField('user', {
+            name: localNickname,
+            color: localColor
+        });
+    }
+    
+    closeModal(profileModal);
+    renderActiveUsersList();
+});
+
+/* ==========================================================================
+   Document Dashboard & Storage Manager
+   ========================================================================== */
+function getRecentDocs() {
+    try {
+        return JSON.parse(localStorage.getItem('ai_collab_recent_docs')) || [];
+    } catch(e) {
+        return [];
+    }
+}
+
+function saveRecentDocs(docs) {
+    localStorage.setItem('ai_collab_recent_docs', JSON.stringify(docs));
+}
+
+function updateRecentDoc(roomId, title) {
+    let docs = getRecentDocs();
+    const index = docs.findIndex(d => d.id === roomId);
+    const timestamp = new Date().toLocaleString('ko-KR');
+    
+    const docTitle = title ? title.trim() : '제목 없는 프로젝트';
+    
+    if (index > -1) {
+        docs[index].title = docTitle;
+        docs[index].updated = timestamp;
+    } else {
+        docs.push({
+            id: roomId,
+            title: docTitle,
+            updated: timestamp
+        });
+    }
+    
+    // Sort: newest updated first
+    docs.sort((a, b) => new Date(b.updated) - new Date(a.updated));
+    // Keep max 10 records
+    if (docs.length > 10) docs = docs.slice(0, 10);
+    
+    saveRecentDocs(docs);
+}
+
+function renameDocumentRecord(roomId, newTitle) {
+    let docs = getRecentDocs();
+    const index = docs.findIndex(d => d.id === roomId);
+    if (index > -1) {
+        docs[index].title = newTitle;
+        saveRecentDocs(docs);
+        renderRecentDocsList();
+        
+        // If it is the current room, sync renaming to the input field
+        if (roomId === currentRoomId && sharedMap) {
+            const projectTitleText = sharedMap.get('project-title');
+            if (projectTitleText) {
+                const len = projectTitleText.length;
+                ydoc.transact(() => {
+                    if (len > 0) projectTitleText.delete(0, len);
+                    projectTitleText.insert(0, newTitle);
+                });
+            }
+        }
+    }
+}
+
+function deleteDocumentRecord(roomId) {
+    let docs = getRecentDocs();
+    docs = docs.filter(d => d.id !== roomId);
+    saveRecentDocs(docs);
+    renderRecentDocsList();
+}
+
+function renderRecentDocsList() {
+    recentDocsList.innerHTML = '';
+    const docs = getRecentDocs();
+    
+    if (docs.length === 0) {
+        recentDocsList.innerHTML = '<div class="no-docs-msg">최근 편집한 문서가 없습니다.</div>';
+        return;
+    }
+    
+    docs.forEach(doc => {
+        const item = document.createElement('div');
+        item.className = 'recent-doc-item';
+        if (doc.id === currentRoomId) {
+            item.style.borderColor = 'var(--primary)';
+            item.style.backgroundColor = 'var(--primary-light)';
+        }
+        
+        item.innerHTML = `
+            <div class="recent-doc-info" data-room-id="${doc.id}">
+                <span class="recent-doc-title">${escapeHtml(doc.title)}</span>
+                <span class="recent-doc-meta">
+                    <span><i class="fa-solid fa-key"></i> ${doc.id}</span>
+                    <span><i class="fa-solid fa-clock"></i> ${doc.updated}</span>
+                </span>
+            </div>
+            <div class="recent-doc-actions">
+                <button class="btn-rename-doc" data-room-id="${doc.id}" title="이름 변경"><i class="fa-solid fa-pen"></i></button>
+                <button class="btn-delete-doc" data-room-id="${doc.id}" title="기록 삭제"><i class="fa-solid fa-trash"></i></button>
+            </div>
+        `;
+        recentDocsList.appendChild(item);
+    });
+    
+    // Bind click events to load selected document
+    recentDocsList.querySelectorAll('.recent-doc-info').forEach(info => {
+        info.addEventListener('click', () => {
+            const rId = info.getAttribute('data-room-id');
+            switchRoom(rId);
+            closeModal(dashboardModal);
+        });
+    });
+    
+    recentDocsList.querySelectorAll('.btn-rename-doc').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const rId = btn.getAttribute('data-room-id');
+            const newTitle = prompt('새로운 문서 제목을 입력하세요:');
+            if (newTitle && newTitle.trim()) {
+                renameDocumentRecord(rId, newTitle.trim());
+            }
+        });
+    });
+    
+    recentDocsList.querySelectorAll('.btn-delete-doc').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const rId = btn.getAttribute('data-room-id');
+            if (confirm('이 문서의 대시보드 기록을 삭제하시겠습니까?\n(실제 네트워크 데이터는 유지되며 대시보드 목록에서만 빠집니다.)')) {
+                deleteDocumentRecord(rId);
+            }
+        });
+    });
+}
+
+function switchRoom(newRoomId) {
+    if (newRoomId === currentRoomId) return;
+    window.location.hash = newRoomId;
+}
+
+// Generate new random document button
+btnNewDoc.addEventListener('click', () => {
+    const randRoomId = 'doc-' + Math.random().toString(36).substring(2, 9);
+    switchRoom(randRoomId);
+    closeModal(dashboardModal);
+});
+
+// Join manual room input button
+btnJoinRoom.addEventListener('click', () => {
+    const roomName = dashboardRoomInput.value.trim();
+    if (!roomName) {
+        alert('방 이름을 입력하세요.');
+        return;
+    }
+    // Clean room string
+    const cleanRoomName = roomName.replace(/\s+/g, '-');
+    switchRoom(cleanRoomName);
+    dashboardRoomInput.value = '';
+    closeModal(dashboardModal);
+});
+
+// Share direct URL link button
+shareBtn.addEventListener('click', () => {
+    const shareUrl = window.location.href;
+    navigator.clipboard.writeText(shareUrl).then(() => {
+        alert(`공유 링크가 클립보드에 복사되었습니다!\n${shareUrl}`);
+    }).catch(err => {
+        console.error('클립보드 복사 실패', err);
+        alert(`수동 복사 링크: ${shareUrl}`);
+    });
+});
+
+/* ==========================================================================
+   Yjs Collaboration & Offline Persistence Engine
+   ========================================================================== */
+
+// 1. Double Bind standard Text Inputs to Y.Text objects (Character-by-character sync)
+function bindInputToYText(element, yText) {
+    if (!element || !yText) return () => {};
+    let isUpdating = false;
+
+    // Set initial text value
+    element.value = yText.toString();
+    if (element.tagName === 'TEXTAREA') {
+        autoGrowTextarea(element);
+    }
+
+    // Local keypress -> Update Y.Text (Diff calculations to prevent caret resets)
+    const onInput = () => {
+        if (isUpdating) return;
+        isUpdating = true;
+        
+        const oldVal = yText.toString();
+        const newVal = element.value;
+        
+        let i = 0;
+        while (i < oldVal.length && i < newVal.length && oldVal[i] === newVal[i]) {
+            i++;
+        }
+        let j = 0;
+        while (j < oldVal.length - i && j < newVal.length - i && oldVal[oldVal.length - 1 - j] === newVal[newVal.length - 1 - j]) {
+            j++;
+        }
+        
+        const deleteCount = oldVal.length - i - j;
+        const insertText = newVal.substring(i, newVal.length - j);
+        
+        ydoc.transact(() => {
+            if (deleteCount > 0) {
+                yText.delete(i, deleteCount);
+            }
+            if (insertText.length > 0) {
+                yText.insert(i, insertText);
+            }
+        });
+        
+        isUpdating = false;
+        showSavingStatus();
+    };
+
+    // Remote update -> update element caret mapping
+    const onObserve = (event) => {
+        if (isUpdating) return;
+        isUpdating = true;
+
+        const selStart = element.selectionStart;
+        const selEnd = element.selectionEnd;
+        const newVal = yText.toString();
+
+        element.value = newVal;
+
+        // Shift caret positions depending on operational delta
+        let newSelStart = selStart;
+        let newSelEnd = selEnd;
+
+        let index = 0;
+        event.delta.forEach(op => {
+            if (op.retain) {
+                index += op.retain;
+            } else if (op.insert) {
+                const len = op.insert.length;
+                if (index < newSelStart) newSelStart += len;
+                if (index < newSelEnd) newSelEnd += len;
+                index += len;
+            } else if (op.delete) {
+                const len = op.delete;
+                if (index < newSelStart) {
+                    newSelStart -= Math.min(len, newSelStart - index);
+                }
+                if (index < newSelEnd) {
+                    newSelEnd -= Math.min(len, newSelEnd - index);
+                }
+            }
+        });
+
+        element.setSelectionRange(newSelStart, newSelEnd);
+        isUpdating = false;
+        
+        if (element.tagName === 'TEXTAREA') {
+            autoGrowTextarea(element);
+        }
+    };
+
+    element.addEventListener('input', onInput);
+    yText.observe(onObserve);
+
+    // Awareness: Focus visual indications
+    const presenceId = element.getAttribute('data-presence-id') || element.getAttribute('data-sync-id') || element.id;
+    const onFocus = () => {
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('focusedField', presenceId);
+        }
+    };
+
+    const onBlur = () => {
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('focusedField', null);
+        }
+    };
+
+    element.addEventListener('focus', onFocus);
+    element.addEventListener('blur', onBlur);
+
+    // Cleanup reference
+    return () => {
+        element.removeEventListener('input', onInput);
+        yText.unobserve(onObserve);
+        element.removeEventListener('focus', onFocus);
+        element.removeEventListener('blur', onBlur);
+    };
+}
+
+// 2. Bind Checkbox states to Yjs Shared Map
+function bindCheckbox(element, yMap) {
+    if (!element || !yMap) return () => {};
+    const syncId = element.getAttribute('data-sync-id');
+    
+    // Set initial
+    element.checked = !!yMap.get(syncId);
+    
+    const onChange = () => {
+        yMap.set(syncId, element.checked);
+        showSavingStatus();
+    };
+    
+    element.addEventListener('change', onChange);
+    
+    // Listen to remote changes on this specific checkbox key
+    const onObserve = (event) => {
+        if (event.keysChanged.has(syncId)) {
+            element.checked = !!yMap.get(syncId);
+        }
+    };
+    yMap.observe(onObserve);
+    
+    const onFocus = () => {
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('focusedField', syncId);
+        }
+    };
+    
+    const onBlur = () => {
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('focusedField', null);
+        }
+    };
+    
+    element.addEventListener('focus', onFocus);
+    element.addEventListener('blur', onBlur);
+    
+    return () => {
+        element.removeEventListener('change', onChange);
+        yMap.unobserve(onObserve);
+        element.removeEventListener('focus', onFocus);
+        element.removeEventListener('blur', onBlur);
+    };
+}
+
+// 3. Bind cell inputs (dropdowns, small inputs) that don't need character diffs
+function bindRowField(element, rowMap, field) {
+    if (!element || !rowMap) return () => {};
+    
+    // Initial
+    element.value = rowMap.get(field) || '';
+    
+    const onInput = () => {
+        rowMap.set(field, element.value);
+        showSavingStatus();
+    };
+    
+    element.addEventListener('input', onInput);
+    
+    const presenceId = `${rowMap.get('id')}-${field}`;
+    const onFocus = () => {
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('focusedField', presenceId);
+        }
+    };
+    
+    const onBlur = () => {
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('focusedField', null);
+        }
+    };
+    
+    element.addEventListener('focus', onFocus);
+    element.addEventListener('blur', onBlur);
+    
+    return () => {
+        element.removeEventListener('input', onInput);
+        element.removeEventListener('focus', onFocus);
+        element.removeEventListener('blur', onBlur);
+    };
+}
+
+// Clean up all bindings before loading another document
+function destroyAllBindings() {
+    activeBindings.forEach(cleanup => cleanup());
+    activeBindings.clear();
+}
+
+/* ==========================================================================
+   Room Connection & Engine Bootstrapping
+   ========================================================================== */
+function connectToRoom(roomName) {
+    if (!roomName) return;
+    
+    currentRoomId = roomName;
+    currentRoomNameEl.textContent = roomName;
+    
+    // 1. Destroy previous connections
+    destroyAllBindings();
+    if (provider) {
+        provider.destroy();
+    }
+    if (persistence) {
+        persistence.destroy();
+    }
+    if (ydoc) {
+        ydoc.destroy();
+    }
+    
+    // 2. Initialize visual state -> Connecting
+    connectionStatus.className = 'status-connecting';
+    connectionStatus.querySelector('.status-text').textContent = '연결 중...';
+    
+    // 3. Create fresh Y.Doc
+    ydoc = new Y.Doc();
+    
+    // 4. Initialize Local IndexedDB Persistence (Offline resilience)
+    persistence = new IndexeddbPersistence(roomName, ydoc);
+    
+    // 5. Initialize WebSocket Sync Provider (Bypasses firewalls, works reliably across networks)
+    provider = new WebsocketProvider(WEBSOCKET_SERVER, roomName, ydoc);
+    
+    // 6. Access Yjs shared types
+    sharedMap = ydoc.getMap('project-data');
+    checkboxMap = ydoc.getMap('checkbox-states');
+    lessonsArray = ydoc.getArray('lessons-array');
+    rolesArray = ydoc.getArray('roles-array');
+    sharedHistoryArray = ydoc.getArray('project-history');
+    
+    // Monitor WebRTC Connection Status
+    provider.on('status', event => {
+        if (event.status === 'connected') {
+            connectionStatus.className = 'status-connected';
+            connectionStatus.querySelector('.status-text').textContent = `공동 작업 중`;
+        } else {
+            connectionStatus.className = 'status-disconnected';
+            connectionStatus.querySelector('.status-text').textContent = '연결 보류';
+        }
+    });
+    
+    // Awareness ( 동접자 상태 ) listener
+    provider.awareness.on('change', () => {
+        renderActiveUsersList();
+        renderFocusedPresenceOutlines();
+    });
+    
+    // Setup Local User Profile settings in awareness immediately
+    provider.awareness.setLocalStateField('user', {
+        name: localNickname,
+        color: localColor
+    });
+    
+    // Setup Yjs Observe listeners
+    setupObservers();
+    
+    // IndexedDB Local restore completion callback
+    persistence.once('synced', () => {
+        console.log('IndexedDB restore complete for room:', roomName);
+        
+        // Wait a short amount of time to merge possible WebRTC incoming states
+        setTimeout(() => {
+            if (lessonsArray.length === 0) {
+                // Completely new document, populate default lessons and roles
+                ydoc.transact(() => {
+                    initializeDefaultData();
+                });
+            }
+            
+            // Perform general rendering and binding
+            bindAllStaticElements();
+            renderLessonsTable();
+            renderRolesTable();
+            renderHistoryList();
+            
+            // Sync current doc metadata
+            const titleText = sharedMap.get('project-title');
+            const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
+            updateRecentDoc(currentRoomId, docTitle);
+        }, 300);
+    });
+}
+
+function setupObservers() {
+    // Array structural updates (Add/Remove rows)
+    lessonsArray.observe(() => {
+        renderLessonsTable();
+    });
+    
+    rolesArray.observe(() => {
+        renderRolesTable();
+    });
+    
+    // Sync single text elements (like Project title changing) to local storage dashboard
+    sharedMap.observe(event => {
+        isSyncing = true;
+        
+        event.keysChanged.forEach(key => {
+            if (key === 'project-title') {
+                const titleText = sharedMap.get('project-title');
+                const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
+                updateRecentDoc(currentRoomId, docTitle);
+            }
+            
+            if (key === 'current-tab') {
+                const isTabSyncEnabled = tabSyncCheckbox && tabSyncCheckbox.checked;
+                if (isTabSyncEnabled) {
+                    switchTabTo(sharedMap.get('current-tab'));
+                }
+            }
+        });
+        
+        isSyncing = false;
+    });
+
+    sharedHistoryArray.observe(() => {
+        renderHistoryList();
+    });
+}
+
+function initializeDefaultData() {
+    // Standard inputs default
+    if (!sharedMap.has('project-title')) {
+        const text = new Y.Text();
+        text.insert(0, '');
+        sharedMap.set('project-title', text);
+    }
+    
+    // Default lessons populate
+    const defaultSteps = ['준비하기', '탐구하기', '탐구하기', '정리하기', '실천하기'];
+    const defaultPeriods = ['1차시', '2차시', '3차시', '4차시', '5차시'];
+    
+    for (let i = 0; i < defaultSteps.length; i++) {
+        const rowMap = new Y.Map();
+        rowMap.set('id', 'l-' + i + '-' + Date.now());
+        rowMap.set('step', defaultSteps[i]);
+        rowMap.set('period', defaultPeriods[i]);
+        
+        const q = new Y.Text();
+        const a = new Y.Text();
+        const t = new Y.Text();
+        const f = new Y.Text();
+        
+        rowMap.set('question', q);
+        rowMap.set('activity', a);
+        rowMap.set('tools', t);
+        rowMap.set('feedback', f);
+        
+        lessonsArray.push([rowMap]);
+    }
+    
+    // Default roles populate
+    const defaultRoleSteps = ['준비하기', '탐구하기', '탐구하기', '탐구하기', '정리·실천·성찰'];
+    const defaultRolePeriods = ['1-3차시', '4-6차시', '7-9차시', '10-12차시', '13-15차시'];
+    
+    for (let i = 0; i < defaultRoleSteps.length; i++) {
+        const rowMap = new Y.Map();
+        rowMap.set('id', 'r-' + i + '-' + Date.now());
+        rowMap.set('step', defaultRoleSteps[i]);
+        rowMap.set('period', defaultRolePeriods[i]);
+        
+        const content = new Y.Text();
+        const member = new Y.Text();
+        
+        rowMap.set('content', content);
+        rowMap.set('member', member);
+        
+        rolesArray.push([rowMap]);
+    }
+}
+
+/* ==========================================================================
+   Binding Core Form Fields
+   ========================================================================== */
+function bindAllStaticElements() {
+    // 1. Text Inputs and Textareas
+    document.querySelectorAll('.sync-input').forEach(element => {
+        const syncId = element.getAttribute('data-sync-id');
+        if (!syncId) return;
+        
+        // Ensure shared type exists in Yjs sharedMap
+        if (!sharedMap.has(syncId)) {
+            const text = new Y.Text();
+            sharedMap.set(syncId, text);
+        }
+        
+        const yText = sharedMap.get(syncId);
+        // Bind element & store cleanup callback
+        const cleanup = bindInputToYText(element, yText);
+        activeBindings.set(`static-${syncId}-${element.id || Math.random()}`, cleanup);
+    });
+    
+    // 2. Checkboxes
+    document.querySelectorAll('.sync-checkbox').forEach(element => {
+        const syncId = element.getAttribute('data-sync-id');
+        if (!syncId) return;
+        
+        const cleanup = bindCheckbox(element, checkboxMap);
+        activeBindings.set(`static-checkbox-${syncId}`, cleanup);
+    });
+}
+
+/* ==========================================================================
+   Lessons Table Rendering & Synchronization
+   ========================================================================== */
+function renderLessonsTable() {
+    // Clean old lessons bindings
+    for (let [key, cleanup] of activeBindings.entries()) {
+        if (key.startsWith('lesson-')) {
+            cleanup();
+            activeBindings.delete(key);
+        }
+    }
+    
+    lessonTbody.innerHTML = '';
+    
+    if (!lessonsArray) return;
+    
+    lessonsArray.forEach(rowMap => {
+        const rowId = rowMap.get('id');
+        const step = rowMap.get('step') || '준비하기';
+        const period = rowMap.get('period') || '';
+        
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>
+                <select class="sync-table-field select-step" data-row-id="${rowId}">
+                    <option value="준비하기" ${step === '준비하기' ? 'selected' : ''}>준비하기</option>
+                    <option value="탐구하기" ${step === '탐구하기' ? 'selected' : ''}>탐구하기</option>
+                    <option value="정리하기" ${step === '정리하기' ? 'selected' : ''}>정리하기</option>
+                    <option value="실천하기" ${step === '실천하기' ? 'selected' : ''}>실천하기</option>
+                </select>
+            </td>
+            <td>
+                <input type="text" class="sync-table-field input-period text-center" data-row-id="${rowId}" placeholder="차시" data-presence-id="${rowId}-period" value="${escapeHtml(period)}">
+            </td>
+            <td>
+                <div class="lesson-cell-group">
+                    <div class="lesson-sub-box orange-box">
+                        <span class="box-title-tag orange">탐구질문</span>
+                        <textarea class="sync-table-text text-question auto-grow" data-row-id="${rowId}" placeholder="탐구 질문을 기술해 주세요." data-presence-id="${rowId}-question"></textarea>
+                    </div>
+                    <div class="lesson-sub-box green-box">
+                        <span class="box-title-tag green">활동 내용</span>
+                        <textarea class="sync-table-text text-activity auto-grow" data-row-id="${rowId}" placeholder="활동 세부 내용을 기술해 주세요." data-presence-id="${rowId}-activity"></textarea>
+                    </div>
+                </div>
+            </td>
+            <td>
+                <textarea class="sync-table-text text-tools auto-grow" data-row-id="${rowId}" placeholder="★교수용&#10;▪학생활동" data-presence-id="${rowId}-tools"></textarea>
+            </td>
+            <td>
+                <textarea class="sync-table-text text-feedback auto-grow" data-row-id="${rowId}" placeholder="피드백 및 평가 내용" data-presence-id="${rowId}-feedback"></textarea>
+            </td>
+            <td class="action-cell no-print">
+                <button class="btn btn-icon btn-danger remove-lesson-btn" data-row-id="${rowId}" title="차시 삭제">
+                    <i class="fa-solid fa-trash-can"></i>
+                </button>
+            </td>
+        `;
+        lessonTbody.appendChild(tr);
+        
+        // Dom References
+        const selectStep = tr.querySelector('.select-step');
+        const inputPeriod = tr.querySelector('.input-period');
+        const textQ = tr.querySelector('.text-question');
+        const textA = tr.querySelector('.text-activity');
+        const textT = tr.querySelector('.text-tools');
+        const textF = tr.querySelector('.text-feedback');
+        
+        // Bind inputs to Y.Maps / Y.Texts
+        activeBindings.set(`lesson-step-${rowId}`, bindRowField(selectStep, rowMap, 'step'));
+        activeBindings.set(`lesson-period-${rowId}`, bindRowField(inputPeriod, rowMap, 'period'));
+        
+        activeBindings.set(`lesson-q-${rowId}`, bindInputToYText(textQ, rowMap.get('question')));
+        activeBindings.set(`lesson-a-${rowId}`, bindInputToYText(textA, rowMap.get('activity')));
+        activeBindings.set(`lesson-t-${rowId}`, bindInputToYText(textT, rowMap.get('tools')));
+        activeBindings.set(`lesson-f-${rowId}`, bindInputToYText(textF, rowMap.get('feedback')));
+    });
+    
+    // Bind deletes
+    lessonTbody.querySelectorAll('.remove-lesson-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const rowId = btn.getAttribute('data-row-id');
+            removeLessonRow(rowId);
+        });
+    });
+    
+    initAutoGrow();
+}
+
+function addLessonRow() {
+    if (!lessonsArray) return;
+    const newId = 'l-' + Date.now();
+    const rowMap = new Y.Map();
+    
+    rowMap.set('id', newId);
+    rowMap.set('step', '탐구하기');
+    rowMap.set('period', `${lessonsArray.length + 1}차시`);
+    
+    rowMap.set('question', new Y.Text());
+    rowMap.set('activity', new Y.Text());
+    rowMap.set('tools', new Y.Text());
+    rowMap.set('feedback', new Y.Text());
+    
+    ydoc.transact(() => {
+        lessonsArray.push([rowMap]);
+    });
+    showSavingStatus();
+}
+
+function removeLessonRow(rowId) {
+    if (!lessonsArray) return;
+    let indexToDelete = -1;
+    for (let i = 0; i < lessonsArray.length; i++) {
+        if (lessonsArray.get(i).get('id') === rowId) {
+            indexToDelete = i;
+            break;
+        }
+    }
+    if (indexToDelete > -1) {
+        ydoc.transact(() => {
+            lessonsArray.delete(indexToDelete, 1);
+        });
+        showSavingStatus();
+    }
+}
+
+addLessonBtn.addEventListener('click', addLessonRow);
+
+/* ==========================================================================
+   Roles Table Rendering & Synchronization
+   ========================================================================== */
+function renderRolesTable() {
+    // Clean old roles bindings
+    for (let [key, cleanup] of activeBindings.entries()) {
+        if (key.startsWith('role-')) {
+            cleanup();
+            activeBindings.delete(key);
+        }
+    }
+    
+    roleTbody.innerHTML = '';
+    if (!rolesArray) return;
+    
+    rolesArray.forEach(rowMap => {
+        const rowId = rowMap.get('id');
+        const step = rowMap.get('step') || '탐구하기';
+        const period = rowMap.get('period') || '';
+        
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>
+                <select class="sync-role-field select-step" data-row-id="${rowId}">
+                    <option value="준비하기" ${step === '준비하기' ? 'selected' : ''}>준비하기</option>
+                    <option value="탐구하기" ${step === '탐구하기' ? 'selected' : ''}>탐구하기</option>
+                    <option value="정리하기" ${step === '정리하기' ? 'selected' : ''}>정리하기</option>
+                    <option value="실천하기" ${step === '실천하기' ? 'selected' : ''}>실천하기</option>
+                    <option value="정리·실천·성찰" ${step === '정리·실천·성찰' ? 'selected' : ''}>정리·실천·성찰</option>
+                </select>
+            </td>
+            <td>
+                <input type="text" class="sync-role-field input-period text-center" data-row-id="${rowId}" placeholder="예: 1-3차시" data-presence-id="${rowId}-period" value="${escapeHtml(period)}">
+            </td>
+            <td>
+                <textarea class="sync-role-text text-content auto-grow" data-row-id="${rowId}" placeholder="담당 설계 및 수행 활동 내용을 기술하세요." data-presence-id="${rowId}-content"></textarea>
+            </td>
+            <td>
+                <input type="text" class="sync-role-text input-member" data-row-id="${rowId}" placeholder="이름 입력" data-presence-id="${rowId}-member">
+            </td>
+            <td class="action-cell no-print">
+                <button class="btn btn-icon btn-danger remove-role-btn" data-row-id="${rowId}" title="역할 삭제">
+                    <i class="fa-solid fa-trash-can"></i>
+                </button>
+            </td>
+        `;
+        roleTbody.appendChild(tr);
+        
+        const selectStep = tr.querySelector('.select-step');
+        const inputPeriod = tr.querySelector('.input-period');
+        const textContent = tr.querySelector('.text-content');
+        const inputMember = tr.querySelector('.input-member');
+        
+        // Bindings
+        activeBindings.set(`role-step-${rowId}`, bindRowField(selectStep, rowMap, 'step'));
+        activeBindings.set(`role-period-${rowId}`, bindRowField(inputPeriod, rowMap, 'period'));
+        
+        activeBindings.set(`role-content-${rowId}`, bindInputToYText(textContent, rowMap.get('content')));
+        activeBindings.set(`role-member-${rowId}`, bindInputToYText(inputMember, rowMap.get('member')));
+    });
+    
+    // Bind deletes
+    roleTbody.querySelectorAll('.remove-role-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const rowId = btn.getAttribute('data-row-id');
+            removeRoleRow(rowId);
+        });
+    });
+    
+    initAutoGrow();
+}
+
+function addRoleRow() {
+    if (!rolesArray) return;
+    const newId = 'r-' + Date.now();
+    const rowMap = new Y.Map();
+    
+    rowMap.set('id', newId);
+    rowMap.set('step', '탐구하기');
+    rowMap.set('period', '');
+    
+    rowMap.set('content', new Y.Text());
+    rowMap.set('member', new Y.Text());
+    
+    ydoc.transact(() => {
+        rolesArray.push([rowMap]);
+    });
+    showSavingStatus();
+}
+
+function removeRoleRow(rowId) {
+    if (!rolesArray) return;
+    let indexToDelete = -1;
+    for (let i = 0; i < rolesArray.length; i++) {
+        if (rolesArray.get(i).get('id') === rowId) {
+            indexToDelete = i;
+            break;
+        }
+    }
+    if (indexToDelete > -1) {
+        ydoc.transact(() => {
+            rolesArray.delete(indexToDelete, 1);
+        });
+        showSavingStatus();
+    }
+}
+
+addRoleBtn.addEventListener('click', addRoleRow);
+
+/* ==========================================================================
+   Awareness Displays (Top users list & Cursors highlighted outlines)
+   ========================================================================== */
+function renderActiveUsersList() {
+    if (!collabUsersList || !provider) return;
+    collabUsersList.innerHTML = '';
+    
+    const states = provider.awareness.getStates();
+    
+    // Display self and other peers
+    states.forEach((state, clientID) => {
+        const user = state.user;
+        if (!user) return;
+        
+        const avatar = document.createElement('div');
+        avatar.className = 'user-avatar';
+        avatar.style.backgroundColor = user.color;
+        
+        // Extract 2 initials from name
+        const initials = user.name.split(' ').map(n => n[0]).join('').substring(0, 2);
+        avatar.textContent = initials;
+        
+        // Tooltip description
+        const isSelf = clientID === ydoc.clientID;
+        avatar.setAttribute('title', `${user.name} ${isSelf ? '(나)' : ''}`);
+        
+        collabUsersList.appendChild(avatar);
+    });
+}
+
+function renderFocusedPresenceOutlines() {
+    // 1. Remove all old outlines & floating presence badges
+    document.querySelectorAll('.presence-focused-outline').forEach(el => {
+        el.classList.remove('presence-focused-outline');
+        el.style.outline = '';
+        el.style.boxShadow = '';
+    });
+    document.querySelectorAll('.presence-label').forEach(el => el.remove());
+    
+    if (!provider) return;
+    
+    const states = provider.awareness.getStates();
+    
+    states.forEach((state, clientID) => {
+        // Skip self focus indications
+        if (clientID === ydoc.clientID) return;
+        
+        const user = state.user;
+        const focusedField = state.focusedField;
+        
+        if (user && focusedField) {
+            // Find input / textarea element by sync ID, presence ID, or DOM ID
+            const element = document.querySelector(`[data-presence-id="${focusedField}"]`) ||
+                            document.querySelector(`[data-sync-id="${focusedField}"]`) ||
+                            document.getElementById(focusedField);
+                            
+            if (element) {
+                // Focus styling
+                element.classList.add('presence-focused-outline');
+                element.style.outline = `2px solid ${user.color}`;
+                element.style.boxShadow = `0 0 0 3px ${user.color}25`;
+                
+                // Create Floating Name Label Badge
+                const label = document.createElement('div');
+                label.className = 'presence-label';
+                label.style.backgroundColor = user.color;
+                label.textContent = user.name;
+                
+                document.body.appendChild(label);
+                
+                // Position label accurately above element client bounds
+                const updateLabelPos = () => {
+                    const rect = element.getBoundingClientRect();
+                    label.style.left = `${rect.left + window.scrollX}px`;
+                    label.style.top = `${rect.top + window.scrollY}px`;
+                };
+                
+                updateLabelPos();
+                
+                // Redraw on dynamic events
+                window.addEventListener('resize', updateLabelPos);
+                window.addEventListener('scroll', updateLabelPos);
+            }
+        }
+    });
+}
+
+/* ==========================================================================
+   Version History Core Functions
+   ========================================================================== */
+function saveSnapshot() {
+    const authorVal = historyAuthorInput.value.trim();
+    const noteVal = historyNoteInput.value.trim();
+
+    if (!authorVal || !noteVal) {
+        alert('작성자 이름과 변경 설명을 모두 입력해 주세요.');
+        return;
+    }
+
+    // Backup nickname preference if edited in history panel
+    if (authorVal !== localNickname) {
+        localNickname = authorVal;
+        localStorage.setItem('ai_collab_nickname', localNickname);
+        if (provider && provider.awareness) {
+            provider.awareness.setLocalStateField('user', { name: localNickname, color: localColor });
+        }
+        renderActiveUsersList();
+    }
+
+    // Capture standard form fields in snapshot object
+    const fieldsData = {};
+    sharedMap.forEach((yText, key) => {
+        if (key !== 'current-tab') {
+            fieldsData[key] = yText.toString();
+        }
+    });
+    
+    const checkboxData = {};
+    checkboxMap.forEach((val, key) => {
+        checkboxData[key] = val;
+    });
+
+    // Capture tables
+    const lessonsData = [];
+    lessonsArray.forEach(rowMap => {
+        lessonsData.push({
+            id: rowMap.get('id'),
+            step: rowMap.get('step'),
+            period: rowMap.get('period'),
+            question: rowMap.get('question').toString(),
+            activity: rowMap.get('activity').toString(),
+            tools: rowMap.get('tools').toString(),
+            feedback: rowMap.get('feedback').toString()
+        });
+    });
+    
+    const rolesData = [];
+    rolesArray.forEach(rowMap => {
+        rolesData.push({
+            id: rowMap.get('id'),
+            step: rowMap.get('step'),
+            period: rowMap.get('period'),
+            content: rowMap.get('content').toString(),
+            member: rowMap.get('member').toString()
+        });
+    });
+
+    // Create snapshot object
+    const newSnapshot = {
+        id: 'v-' + Date.now(),
+        timestamp: new Date().toLocaleString('ko-KR'),
+        author: authorVal,
+        note: noteVal,
+        data: {
+            fields: fieldsData,
+            checkboxes: checkboxData,
+            lessons: lessonsData,
+            roles: rolesData
+        }
+    };
+
+    if (sharedHistoryArray) {
+        ydoc.transact(() => {
+            sharedHistoryArray.push([newSnapshot]);
+        });
+    }
+
+    // Reset Form
+    historyNoteInput.value = '';
+    alert('현재 버전이 기록되었습니다.');
+}
+
+function restoreSnapshot(versionId) {
+    if (!sharedHistoryArray) return;
+    
+    const history = sharedHistoryArray.toArray();
+    const version = history.find(v => v.id === versionId);
+    if (!version) return;
+
+    const confirmMsg = `정말 이 버전으로 복원하시겠습니까?\n[경고] 연결된 모든 참여자의 화면이 이 시점으로 동시에 복원됩니다.`;
+    if (!confirm(confirmMsg)) return;
+
+    // Block observe loops
+    destroyAllBindings();
+
+    ydoc.transact(() => {
+        // 1. Restore standard single inputs
+        const fields = version.data.fields;
+        Object.keys(fields).forEach(syncId => {
+            if (!sharedMap.has(syncId)) {
+                sharedMap.set(syncId, new Y.Text());
+            }
+            const yText = sharedMap.get(syncId);
+            const len = yText.length;
+            if (len > 0) yText.delete(0, len);
+            yText.insert(0, fields[syncId]);
+        });
+        
+        // 2. Restore checkboxes
+        const checkboxes = version.data.checkboxes || {};
+        // Clear old checkbox values
+        checkboxMap.forEach((_, key) => {
+            if (!(key in checkboxes)) {
+                checkboxMap.delete(key);
+            }
+        });
+        Object.keys(checkboxes).forEach(key => {
+            checkboxMap.set(key, checkboxes[key]);
+        });
+
+        // 3. Restore lessons
+        const lenL = lessonsArray.length;
+        if (lenL > 0) lessonsArray.delete(0, lenL);
+        
+        const lessons = version.data.lessons;
+        lessons.forEach(l => {
+            const rowMap = new Y.Map();
+            rowMap.set('id', l.id);
+            rowMap.set('step', l.step);
+            rowMap.set('period', l.period);
+            
+            const q = new Y.Text(); q.insert(0, l.question || '');
+            const a = new Y.Text(); a.insert(0, l.activity || '');
+            const t = new Y.Text(); t.insert(0, l.tools || '');
+            const f = new Y.Text(); f.insert(0, l.feedback || '');
+            
+            rowMap.set('question', q);
+            rowMap.set('activity', a);
+            rowMap.set('tools', t);
+            rowMap.set('feedback', f);
+            
+            lessonsArray.push([rowMap]);
+        });
+
+        // 4. Restore roles
+        const lenR = rolesArray.length;
+        if (lenR > 0) rolesArray.delete(0, lenR);
+        
+        const roles = version.data.roles;
+        roles.forEach(r => {
+            const rowMap = new Y.Map();
+            rowMap.set('id', r.id);
+            rowMap.set('step', r.step);
+            rowMap.set('period', r.period);
+            
+            const content = new Y.Text(); content.insert(0, r.content || '');
+            const member = new Y.Text(); member.insert(0, r.member || '');
+            
+            rowMap.set('content', content);
+            rowMap.set('member', member);
+            
+            rolesArray.push([rowMap]);
+        });
+    });
+
+    // Re-bind elements
+    bindAllStaticElements();
+    renderLessonsTable();
+    renderRolesTable();
+
+    alert(`[${version.note}] 버전으로 성공적으로 복원되었습니다.`);
+}
+
+function deleteSnapshot(versionId) {
+    if (!confirm('이 버전 이력을 영구히 삭제하시겠습니까?')) return;
+
+    if (sharedHistoryArray) {
+        const history = sharedHistoryArray.toArray();
+        const index = history.findIndex(v => v.id === versionId);
+        if (index > -1) {
+            ydoc.transact(() => {
+                sharedHistoryArray.delete(index, 1);
+            });
+        }
+    }
+}
+
+function renderHistoryList() {
+    if (!historyList || !sharedHistoryArray) return;
+    historyList.innerHTML = '';
+    
+    const history = sharedHistoryArray.toArray();
+
+    if (history.length === 0) {
+        historyList.innerHTML = '<div class="no-history-msg">저장된 버전 이력이 없습니다.</div>';
+        return;
+    }
+
+    // Render items in reverse chronological order
+    const reversedHistory = [...history].reverse();
+
+    reversedHistory.forEach(version => {
+        const card = document.createElement('div');
+        card.className = 'history-card';
+        card.innerHTML = `
+            <div class="history-card-header">
+                <span class="history-card-time">${version.timestamp}</span>
+                <span class="history-card-author">${escapeHtml(version.author)}</span>
+            </div>
+            <div class="history-card-note">${escapeHtml(version.note)}</div>
+            <div class="history-card-actions">
+                <button class="btn-history-restore" data-id="${version.id}"><i class="fa-solid fa-rotate-left"></i> 복원</button>
+                <button class="btn-history-delete" data-id="${version.id}"><i class="fa-solid fa-trash"></i> 삭제</button>
+            </div>
+        `;
+        historyList.appendChild(card);
+    });
+
+    // Bind version history actions
+    historyList.querySelectorAll('.btn-history-restore').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const id = btn.getAttribute('data-id');
+            restoreSnapshot(id);
+        });
+    });
+
+    historyList.querySelectorAll('.btn-history-delete').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const id = btn.getAttribute('data-id');
+            deleteSnapshot(id);
+        });
+    });
+}
+
+saveVersionBtn.addEventListener('click', saveSnapshot);
+
+/* ==========================================================================
+   JSON Import / Export Utilities
+   ========================================================================== */
+function exportToJSON() {
+    if (!sharedMap || !lessonsArray || !rolesArray) return;
+    
+    const fieldsData = {};
+    sharedMap.forEach((yText, key) => {
+        if (key !== 'current-tab') {
+            fieldsData[key] = yText.toString();
+        }
+    });
+    
+    const checkboxData = {};
+    checkboxMap.forEach((val, key) => {
+        checkboxData[key] = val;
+    });
+
+    const lessonsData = [];
+    lessonsArray.forEach(rowMap => {
+        lessonsData.push({
+            id: rowMap.get('id'),
+            step: rowMap.get('step'),
+            period: rowMap.get('period'),
+            question: rowMap.get('question').toString(),
+            activity: rowMap.get('activity').toString(),
+            tools: rowMap.get('tools').toString(),
+            feedback: rowMap.get('feedback').toString()
+        });
+    });
+    
+    const rolesData = [];
+    rolesArray.forEach(rowMap => {
+        rolesData.push({
+            id: rowMap.get('id'),
+            step: rowMap.get('step'),
+            period: rowMap.get('period'),
+            content: rowMap.get('content').toString(),
+            member: rowMap.get('member').toString()
+        });
+    });
+
+    const documentData = {
+        meta: {
+            appName: "AI·디지털 기반 프로젝트 수업 설계 도구",
+            createdAt: new Date().toISOString(),
+            roomName: currentRoomId
+        },
+        fields: fieldsData,
+        checkboxes: checkboxData,
+        lessons: lessonsData,
+        roles: rolesData,
+        history: sharedHistoryArray.toArray()
+    };
+
+    const jsonString = JSON.stringify(documentData, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    const projectTitle = fieldsData['project-title'] || '제목없는_설계서';
+    a.download = `${projectTitle.replace(/\s+/g, '_')}_설계서.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+function handleJSONImport(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+        try {
+            const importedData = JSON.parse(evt.target.result);
+            
+            if (!importedData.fields || !importedData.lessons || !importedData.roles) {
+                alert('유효하지 않은 프로젝트 설계서 JSON 파일입니다.');
+                return;
+            }
+
+            destroyAllBindings();
+
+            ydoc.transact(() => {
+                // 1. Load standard text fields
+                Object.keys(importedData.fields).forEach(syncId => {
+                    if (!sharedMap.has(syncId)) {
+                        sharedMap.set(syncId, new Y.Text());
+                    }
+                    const yText = sharedMap.get(syncId);
+                    const len = yText.length;
+                    if (len > 0) yText.delete(0, len);
+                    yText.insert(0, importedData.fields[syncId]);
+                });
+                
+                // 2. Load checkboxes
+                const checkboxes = importedData.checkboxes || {};
+                checkboxMap.forEach((_, key) => {
+                    if (!(key in checkboxes)) {
+                        checkboxMap.delete(key);
+                    }
+                });
+                Object.keys(checkboxes).forEach(key => {
+                    checkboxMap.set(key, checkboxes[key]);
+                });
+
+                // 3. Load lessons
+                const lenL = lessonsArray.length;
+                if (lenL > 0) lessonsArray.delete(0, lenL);
+                importedData.lessons.forEach(l => {
+                    const rowMap = new Y.Map();
+                    rowMap.set('id', l.id);
+                    rowMap.set('step', l.step);
+                    rowMap.set('period', l.period);
+                    
+                    const q = new Y.Text(); q.insert(0, l.question || '');
+                    const a = new Y.Text(); a.insert(0, l.activity || '');
+                    const t = new Y.Text(); t.insert(0, l.tools || '');
+                    const f = new Y.Text(); f.insert(0, l.feedback || '');
+                    
+                    rowMap.set('question', q);
+                    rowMap.set('activity', a);
+                    rowMap.set('tools', t);
+                    rowMap.set('feedback', f);
+                    
+                    lessonsArray.push([rowMap]);
+                });
+
+                // 4. Load roles
+                const lenR = rolesArray.length;
+                if (lenR > 0) rolesArray.delete(0, lenR);
+                importedData.roles.forEach(r => {
+                    const rowMap = new Y.Map();
+                    rowMap.set('id', r.id);
+                    rowMap.set('step', r.step);
+                    rowMap.set('period', r.period);
+                    
+                    const content = new Y.Text(); content.insert(0, r.content || '');
+                    const member = new Y.Text(); member.insert(0, r.member || '');
+                    
+                    rowMap.set('content', content);
+                    rowMap.set('member', member);
+                    
+                    rolesArray.push([rowMap]);
+                });
+
+                // 5. Load History
+                if (importedData.history) {
+                    const lenH = sharedHistoryArray.length;
+                    if (lenH > 0) sharedHistoryArray.delete(0, lenH);
+                    sharedHistoryArray.push(importedData.history);
+                }
+            });
+
+            // Re-bind elements
+            bindAllStaticElements();
+            renderLessonsTable();
+            renderRolesTable();
+            
+            // Trigger auto-grow
+            setTimeout(initAutoGrow, 100);
+
+            alert('프로젝트 설계서를 성공적으로 불러왔습니다!');
+        } catch(err) {
+            alert('JSON 파싱 오류: 올바른 파일이 아닙니다.');
+            console.error(err);
+        }
+    };
+    reader.readAsText(file);
+}
+
+exportJsonBtn.addEventListener('click', exportToJSON);
+importJsonTrigger.addEventListener('click', () => importJsonFile.click());
+importJsonFile.addEventListener('change', handleJSONImport);
+
+/* ==========================================================================
+   Print Handling
+   ========================================================================== */
+printBtn.addEventListener('click', () => {
+    window.print();
+});
+
+// Dynamic print replacements to prevent truncation of text inside text boxes
+window.addEventListener('beforeprint', () => {
+    const fields = document.querySelectorAll('input[type="text"], textarea, select');
+    fields.forEach(field => {
+        const replacement = document.createElement(field.tagName === 'TEXTAREA' ? 'div' : 'span');
+        replacement.className = 'print-replacement';
+        
+        let value = '';
+        if (field.tagName === 'SELECT') {
+            value = field.options[field.selectedIndex]?.text || '';
+        } else {
+            value = field.value || '';
+        }
+        
+        // Set text content
+        replacement.textContent = value;
+        
+        // Retain format classes
+        if (field.classList.contains('text-center')) {
+            replacement.classList.add('text-center');
+        }
+        if (field.classList.contains('full-width')) {
+            replacement.classList.add('full-width');
+        }
+        
+        // Insert replacement next to the original input/textarea
+        field.parentNode.insertBefore(replacement, field.nextSibling);
+    });
+});
+
+window.addEventListener('afterprint', () => {
+    const replacements = document.querySelectorAll('.print-replacement');
+    replacements.forEach(el => el.remove());
+});
+
+/* ==========================================================================
+   App Initialization
+   ========================================================================== */
+function init() {
+    initTheme();
+    loadUserProfile();
+    
+    // URL Hash Routing Setup (e.g. #doc-abcd)
+    let initialRoom = window.location.hash.slice(1);
+    if (!initialRoom) {
+        // Last active room restore fallback, otherwise generate new random
+        const docs = getRecentDocs();
+        if (docs.length > 0) {
+            initialRoom = docs[0].id;
+        } else {
+            initialRoom = 'doc-' + Math.random().toString(36).substring(2, 9);
+        }
+        window.location.hash = initialRoom;
+    }
+    
+    connectToRoom(initialRoom);
+    
+    // Listen to tab sync options
+    tabSyncCheckbox.addEventListener('change', () => {
+        const isTabSyncEnabled = tabSyncCheckbox.checked;
+        localStorage.setItem('tab_sync_enabled', isTabSyncEnabled ? 'true' : 'false');
+        if (isTabSyncEnabled && sharedMap) {
+            const activeTab = document.querySelector('.tab-btn.active');
+            if (activeTab) {
+                sharedMap.set('current-tab', activeTab.getAttribute('data-tab'));
+            }
+        }
+    });
+    
+    const savedTabSync = localStorage.getItem('tab_sync_enabled') === 'true';
+    tabSyncCheckbox.checked = savedTabSync;
+}
+
+// Router Event Listener
+window.addEventListener('hashchange', () => {
+    const newRoom = window.location.hash.slice(1);
+    if (newRoom && newRoom !== currentRoomId) {
+        connectToRoom(newRoom);
+    }
+});
+
+// Boot Application
+window.addEventListener('DOMContentLoaded', init);
