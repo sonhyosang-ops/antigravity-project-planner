@@ -25,8 +25,7 @@ let localNickname = '';
 let localColor = '';
 
 // Central WebSocket sync server (Google Docs client-server architecture)
-const WEBSOCKET_SERVER = 'wss://demos.yjs.dev';
-
+const WEBSOCKET_SERVER = 'wss://antigravity-yjs-server.onrender.com';
 // Pastel colors list for user cursors and avatars
 const USER_COLORS = [
     '#3b82f6', // blue
