@@ -1,6 +1,7 @@
 import * as Y from 'https://esm.sh/yjs@13.6.10';
 import { WebsocketProvider } from 'https://esm.sh/y-websocket@3.0.0?deps=yjs@13.6.10';
 import { IndexeddbPersistence } from 'https://esm.sh/y-indexeddb@9.0.12?deps=yjs@13.6.10';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 /* ==========================================================================
    State & Global Variables
@@ -23,9 +24,18 @@ let currentRoomId = 'ai-project-room';
 // Local user profile state
 let localNickname = '';
 let localColor = '';
+let pendingAuthEmail = '';
+let currentUser = null;
+let supabase = null;
+let supabaseDocumentId = null;
+let supabaseSaveTimer = null;
+let isSupabaseSaving = false;
+let hasCollaborationRpc = true;
 
 // Central WebSocket sync server (Google Docs client-server architecture)
 const WEBSOCKET_SERVER = 'wss://antigravity-yjs-server.onrender.com';
+const SUPABASE_URL = 'https://gyswkfahujjrnaftxkni.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_YlubmMU5E8Aje1OUuyppIw_I8KttKg9';
 // Pastel colors list for user cursors and avatars
 const USER_COLORS = [
     '#3b82f6', // blue
@@ -81,6 +91,9 @@ const currentRoomNameEl = document.getElementById('current-room-name');
 const shareBtn = document.getElementById('share-btn');
 const collabUsersList = document.getElementById('collab-users-list');
 const connectionStatus = document.getElementById('connection-status');
+const authStatusBadge = document.getElementById('auth-status-badge');
+const authOpenBtn = document.getElementById('auth-open-btn');
+const authLogoutBtn = document.getElementById('auth-logout-btn');
 
 // Modals DOM Elements
 const dashboardBtn = document.getElementById('dashboard-btn');
@@ -97,6 +110,13 @@ const closeProfileBtn = document.getElementById('close-profile-btn');
 const profileNicknameInput = document.getElementById('profile-nickname');
 const profileColorsGrid = document.getElementById('profile-colors-grid');
 const profileSaveBtn = document.getElementById('profile-save-btn');
+const authModal = document.getElementById('auth-modal');
+const closeAuthBtn = document.getElementById('close-auth-btn');
+const authEmailInput = document.getElementById('auth-email');
+const authSendCodeBtn = document.getElementById('auth-send-code-btn');
+const authOtpInput = document.getElementById('auth-otp');
+const authVerifyBtn = document.getElementById('auth-verify-btn');
+const authMessage = document.getElementById('auth-message');
 
 /* ==========================================================================
    Helper Functions
@@ -122,6 +142,8 @@ function showSavingStatus() {
     saveTimeout = setTimeout(() => {
         showSavedStatus();
     }, 800);
+
+    scheduleSupabaseAutoSave();
 }
 
 function showSavedStatus() {
@@ -232,6 +254,7 @@ closeDashboardBtn.addEventListener('click', () => closeModal(dashboardModal));
 window.addEventListener('click', (e) => {
     if (e.target === dashboardModal) closeModal(dashboardModal);
     if (e.target === profileModal) closeModal(profileModal);
+    if (e.target === authModal) closeModal(authModal);
 });
 
 userProfileBtn.addEventListener('click', () => {
@@ -240,6 +263,432 @@ userProfileBtn.addEventListener('click', () => {
     openModal(profileModal);
 });
 closeProfileBtn.addEventListener('click', () => closeModal(profileModal));
+authOpenBtn.addEventListener('click', () => openModal(authModal));
+closeAuthBtn.addEventListener('click', () => closeModal(authModal));
+
+function setAuthMessage(message, type = 'info') {
+    if (!authMessage) return;
+    authMessage.textContent = message;
+    authMessage.classList.remove('is-error', 'is-success');
+    if (type === 'error') authMessage.classList.add('is-error');
+    if (type === 'success') authMessage.classList.add('is-success');
+}
+
+function updateAuthUI() {
+    if (!authStatusBadge || !authOpenBtn || !authLogoutBtn) return;
+
+    if (currentUser) {
+        authStatusBadge.textContent = `${currentUser.email} 로그인됨`;
+        authStatusBadge.classList.remove('auth-logged-out');
+        authStatusBadge.classList.add('auth-logged-in');
+        authOpenBtn.style.display = 'none';
+        authLogoutBtn.style.display = 'inline-flex';
+        if (authEmailInput) authEmailInput.value = currentUser.email || pendingAuthEmail || '';
+    } else {
+        authStatusBadge.textContent = '로그인 필요';
+        authStatusBadge.classList.remove('auth-logged-in');
+        authStatusBadge.classList.add('auth-logged-out');
+        authOpenBtn.style.display = 'inline-flex';
+        authLogoutBtn.style.display = 'none';
+    }
+}
+
+function deriveDocumentTitle(documentData) {
+    return documentData.fields?.['project-title']?.trim() || '제목 없는 프로젝트';
+}
+
+function getCurrentDocumentData() {
+    const fieldsData = {};
+    sharedMap.forEach((yText, key) => {
+        if (key !== 'current-tab') {
+            fieldsData[key] = yText.toString();
+        }
+    });
+
+    const checkboxData = {};
+    checkboxMap.forEach((val, key) => {
+        checkboxData[key] = val;
+    });
+
+    const lessonsData = [];
+    lessonsArray.forEach(rowMap => {
+        lessonsData.push({
+            id: rowMap.get('id'),
+            step: rowMap.get('step'),
+            period: rowMap.get('period'),
+            question: rowMap.get('question').toString(),
+            activity: rowMap.get('activity').toString(),
+            tools: rowMap.get('tools').toString(),
+            feedback: rowMap.get('feedback').toString()
+        });
+    });
+
+    const rolesData = [];
+    rolesArray.forEach(rowMap => {
+        rolesData.push({
+            id: rowMap.get('id'),
+            step: rowMap.get('step'),
+            period: rowMap.get('period'),
+            content: rowMap.get('content').toString(),
+            member: rowMap.get('member').toString()
+        });
+    });
+
+    return {
+        meta: {
+            appName: "AI·디지털 기반 프로젝트 수업 설계 도구",
+            createdAt: new Date().toISOString(),
+            roomName: currentRoomId
+        },
+        fields: fieldsData,
+        checkboxes: checkboxData,
+        lessons: lessonsData,
+        roles: rolesData,
+        history: sharedHistoryArray.toArray()
+    };
+}
+
+function hydrateDocumentData(importedData) {
+    if (!importedData.fields || !importedData.lessons || !importedData.roles) {
+        throw new Error('유효하지 않은 프로젝트 설계 데이터입니다.');
+    }
+
+    destroyAllBindings();
+
+    ydoc.transact(() => {
+        Object.keys(importedData.fields).forEach(syncId => {
+            if (!sharedMap.has(syncId)) {
+                sharedMap.set(syncId, new Y.Text());
+            }
+            const yText = sharedMap.get(syncId);
+            const len = yText.length;
+            if (len > 0) yText.delete(0, len);
+            yText.insert(0, importedData.fields[syncId]);
+        });
+
+        const checkboxes = importedData.checkboxes || {};
+        checkboxMap.forEach((_, key) => {
+            if (!(key in checkboxes)) {
+                checkboxMap.delete(key);
+            }
+        });
+        Object.keys(checkboxes).forEach(key => {
+            checkboxMap.set(key, checkboxes[key]);
+        });
+
+        const lenL = lessonsArray.length;
+        if (lenL > 0) lessonsArray.delete(0, lenL);
+        importedData.lessons.forEach(l => {
+            const rowMap = new Y.Map();
+            rowMap.set('id', l.id);
+            rowMap.set('step', l.step);
+            rowMap.set('period', l.period);
+
+            const q = new Y.Text(); q.insert(0, l.question || '');
+            const a = new Y.Text(); a.insert(0, l.activity || '');
+            const t = new Y.Text(); t.insert(0, l.tools || '');
+            const f = new Y.Text(); f.insert(0, l.feedback || '');
+
+            rowMap.set('question', q);
+            rowMap.set('activity', a);
+            rowMap.set('tools', t);
+            rowMap.set('feedback', f);
+            lessonsArray.push([rowMap]);
+        });
+
+        const lenR = rolesArray.length;
+        if (lenR > 0) rolesArray.delete(0, lenR);
+        importedData.roles.forEach(r => {
+            const rowMap = new Y.Map();
+            rowMap.set('id', r.id);
+            rowMap.set('step', r.step);
+            rowMap.set('period', r.period);
+
+            const content = new Y.Text(); content.insert(0, r.content || '');
+            const member = new Y.Text(); member.insert(0, r.member || '');
+
+            rowMap.set('content', content);
+            rowMap.set('member', member);
+            rolesArray.push([rowMap]);
+        });
+
+        const lenH = sharedHistoryArray.length;
+        if (lenH > 0) sharedHistoryArray.delete(0, lenH);
+        if (importedData.history?.length) {
+            sharedHistoryArray.push(importedData.history);
+        }
+    });
+
+    bindAllStaticElements();
+    renderLessonsTable();
+    renderRolesTable();
+    renderHistoryList();
+    setTimeout(initAutoGrow, 100);
+}
+
+function documentHasMeaningfulContent(documentData) {
+    if (Object.values(documentData.fields || {}).some(value => (value || '').trim() !== '')) {
+        return true;
+    }
+    if (Object.values(documentData.checkboxes || {}).some(Boolean)) {
+        return true;
+    }
+    if ((documentData.lessons || []).some(lesson => ['question', 'activity', 'tools', 'feedback'].some(key => (lesson[key] || '').trim() !== ''))) {
+        return true;
+    }
+    if ((documentData.roles || []).some(role => ['content', 'member'].some(key => (role[key] || '').trim() !== ''))) {
+        return true;
+    }
+    return (documentData.history || []).length > 0;
+}
+
+async function bootstrapSupabaseDocumentForRoom() {
+    if (!supabase || !currentUser || !sharedMap) return;
+
+    const data = await resolveSupabaseDocumentForRoom();
+    if (!data) {
+        supabaseDocumentId = null;
+        return;
+    }
+
+    supabaseDocumentId = data.id;
+
+    const currentData = getCurrentDocumentData();
+    if (!documentHasMeaningfulContent(currentData) && data.snapshot_json) {
+        hydrateDocumentData(data.snapshot_json);
+        setAuthMessage('Supabase 저장본을 불러왔습니다.', 'success');
+    }
+}
+
+async function resolveSupabaseDocumentForRoom() {
+    if (!supabase || !currentUser) return null;
+
+    if (hasCollaborationRpc) {
+        const { data, error } = await supabase.rpc('join_document_by_room', {
+            p_room_id: currentRoomId
+        });
+
+        if (!error) {
+            return Array.isArray(data) ? data[0] || null : data || null;
+        }
+
+        const missingRpc = /join_document_by_room|Could not find the function|PGRST202/i.test(error.message || '');
+        if (!missingRpc) {
+            setAuthMessage(`저장 문서 확인 실패: ${error.message}`, 'error');
+            return null;
+        }
+
+        hasCollaborationRpc = false;
+    }
+
+    const { data, error } = await supabase
+        .from('documents')
+        .select('id, snapshot_json')
+        .eq('room_id', currentRoomId)
+        .maybeSingle();
+
+    if (error) {
+        setAuthMessage(`저장 문서 확인 실패: ${error.message}`, 'error');
+        return null;
+    }
+
+    return data;
+}
+
+function scheduleSupabaseAutoSave() {
+    if (!currentUser || !supabase || !sharedMap) return;
+
+    if (supabaseSaveTimer) clearTimeout(supabaseSaveTimer);
+    supabaseSaveTimer = setTimeout(() => {
+        saveCurrentDocumentToSupabase();
+    }, 2000);
+}
+
+async function saveCurrentDocumentToSupabase(options = {}) {
+    if (!currentUser || !supabase || !sharedMap || isSupabaseSaving) return;
+    isSupabaseSaving = true;
+
+    const documentData = getCurrentDocumentData();
+    const title = deriveDocumentTitle(documentData);
+
+    try {
+        if (!supabaseDocumentId) {
+            const existingDoc = await resolveSupabaseDocumentForRoom();
+            if (existingDoc) {
+                supabaseDocumentId = existingDoc.id;
+            }
+        }
+
+        if (supabaseDocumentId) {
+            const { error } = await supabase
+                .from('documents')
+                .update({
+                    title,
+                    snapshot_json: documentData,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('id', supabaseDocumentId);
+
+            if (error) throw error;
+        } else {
+            const { data, error } = await supabase
+                .from('documents')
+                .insert({
+                    owner_user_id: currentUser.id,
+                    room_id: currentRoomId,
+                    title,
+                    snapshot_json: documentData
+                })
+                .select('id')
+                .single();
+
+            if (error) {
+                const roomAlreadyExists = error.code === '23505' || /duplicate key/i.test(error.message || '');
+                if (roomAlreadyExists) {
+                    const joinedDoc = await resolveSupabaseDocumentForRoom();
+                    if (joinedDoc) {
+                        supabaseDocumentId = joinedDoc.id;
+                        const { error: retryError } = await supabase
+                            .from('documents')
+                            .update({
+                                title,
+                                snapshot_json: documentData,
+                                updated_at: new Date().toISOString()
+                            })
+                            .eq('id', supabaseDocumentId);
+                        if (retryError) throw retryError;
+                    } else {
+                        throw error;
+                    }
+                } else {
+                    throw error;
+                }
+            }
+            if (data?.id) {
+                supabaseDocumentId = data.id;
+            }
+        }
+
+        if (options.saveVersion && supabaseDocumentId) {
+            const { error } = await supabase
+                .from('document_versions')
+                .insert({
+                    document_id: supabaseDocumentId,
+                    saved_by_user_id: currentUser.id,
+                    snapshot_json: documentData
+                });
+
+            if (error) throw error;
+        }
+
+        setAuthMessage('로그인된 계정에 자동 저장되었습니다.', 'success');
+    } catch (error) {
+        setAuthMessage(`자동 저장 실패: ${error.message}`, 'error');
+    } finally {
+        isSupabaseSaving = false;
+    }
+}
+
+async function sendOtpCode() {
+    if (!supabase) return;
+
+    const email = authEmailInput.value.trim();
+    if (!email) {
+        setAuthMessage('이메일을 입력해 주세요.', 'error');
+        return;
+    }
+
+    pendingAuthEmail = email;
+    authSendCodeBtn.disabled = true;
+    setAuthMessage('로그인 코드를 보내는 중입니다...');
+
+    const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: {
+            shouldCreateUser: true
+        }
+    });
+
+    authSendCodeBtn.disabled = false;
+
+    if (error) {
+        setAuthMessage(`코드 발송 실패: ${error.message}`, 'error');
+        return;
+    }
+
+    setAuthMessage('이메일로 로그인 코드를 보냈습니다.', 'success');
+    authOtpInput.focus();
+}
+
+async function verifyOtpCode() {
+    if (!supabase) return;
+
+    const email = authEmailInput.value.trim() || pendingAuthEmail;
+    const token = authOtpInput.value.trim();
+
+    if (!email || !token) {
+        setAuthMessage('이메일과 로그인 코드를 모두 입력해 주세요.', 'error');
+        return;
+    }
+
+    authVerifyBtn.disabled = true;
+    setAuthMessage('코드를 확인하는 중입니다...');
+
+    const { data, error } = await supabase.auth.verifyOtp({
+        email,
+        token,
+        type: 'email'
+    });
+
+    authVerifyBtn.disabled = false;
+
+    if (error) {
+        setAuthMessage(`인증 실패: ${error.message}`, 'error');
+        return;
+    }
+
+    currentUser = data.user;
+    updateAuthUI();
+    setAuthMessage('로그인되었습니다. 현재 문서를 자동 저장합니다.', 'success');
+    closeModal(authModal);
+    await bootstrapSupabaseDocumentForRoom();
+    await saveCurrentDocumentToSupabase();
+}
+
+async function logoutSupabase() {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    currentUser = null;
+    supabaseDocumentId = null;
+    updateAuthUI();
+    setAuthMessage('로그아웃되었습니다.');
+}
+
+function initSupabaseAuth() {
+    supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+    updateAuthUI();
+
+    authSendCodeBtn.addEventListener('click', sendOtpCode);
+    authVerifyBtn.addEventListener('click', verifyOtpCode);
+    authLogoutBtn.addEventListener('click', logoutSupabase);
+
+    supabase.auth.getSession().then(async ({ data }) => {
+        currentUser = data.session?.user || null;
+        updateAuthUI();
+        if (currentUser) {
+            await bootstrapSupabaseDocumentForRoom();
+        }
+    });
+
+    supabase.auth.onAuthStateChange(async (_event, session) => {
+        currentUser = session?.user || null;
+        supabaseDocumentId = null;
+        updateAuthUI();
+        if (currentUser) {
+            await bootstrapSupabaseDocumentForRoom();
+        }
+    });
+}
 
 /* ==========================================================================
    User Profile Management (Nickname & Cursors Color)
@@ -693,6 +1142,7 @@ function connectToRoom(roomName) {
     
     currentRoomId = roomName;
     currentRoomNameEl.textContent = roomName;
+    supabaseDocumentId = null;
     
     // 1. Destroy previous connections
     destroyAllBindings();
@@ -775,6 +1225,9 @@ function connectToRoom(roomName) {
             const titleText = sharedMap.get('project-title');
             const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
             updateRecentDoc(currentRoomId, docTitle);
+            if (currentUser) {
+                bootstrapSupabaseDocumentForRoom();
+            }
         }, 300);
     });
 }
@@ -1305,6 +1758,7 @@ function saveSnapshot() {
     // Reset Form
     historyNoteInput.value = '';
     alert('현재 버전이 기록되었습니다.');
+    saveCurrentDocumentToSupabase({ saveVersion: true });
 }
 
 function restoreSnapshot(versionId) {
@@ -1466,55 +1920,7 @@ saveVersionBtn.addEventListener('click', saveSnapshot);
    ========================================================================== */
 function exportToJSON() {
     if (!sharedMap || !lessonsArray || !rolesArray) return;
-    
-    const fieldsData = {};
-    sharedMap.forEach((yText, key) => {
-        if (key !== 'current-tab') {
-            fieldsData[key] = yText.toString();
-        }
-    });
-    
-    const checkboxData = {};
-    checkboxMap.forEach((val, key) => {
-        checkboxData[key] = val;
-    });
-
-    const lessonsData = [];
-    lessonsArray.forEach(rowMap => {
-        lessonsData.push({
-            id: rowMap.get('id'),
-            step: rowMap.get('step'),
-            period: rowMap.get('period'),
-            question: rowMap.get('question').toString(),
-            activity: rowMap.get('activity').toString(),
-            tools: rowMap.get('tools').toString(),
-            feedback: rowMap.get('feedback').toString()
-        });
-    });
-    
-    const rolesData = [];
-    rolesArray.forEach(rowMap => {
-        rolesData.push({
-            id: rowMap.get('id'),
-            step: rowMap.get('step'),
-            period: rowMap.get('period'),
-            content: rowMap.get('content').toString(),
-            member: rowMap.get('member').toString()
-        });
-    });
-
-    const documentData = {
-        meta: {
-            appName: "AI·디지털 기반 프로젝트 수업 설계 도구",
-            createdAt: new Date().toISOString(),
-            roomName: currentRoomId
-        },
-        fields: fieldsData,
-        checkboxes: checkboxData,
-        lessons: lessonsData,
-        roles: rolesData,
-        history: sharedHistoryArray.toArray()
-    };
+    const documentData = getCurrentDocumentData();
 
     const jsonString = JSON.stringify(documentData, null, 2);
     const blob = new Blob([jsonString], { type: 'application/json' });
@@ -1522,7 +1928,7 @@ function exportToJSON() {
     
     const a = document.createElement('a');
     a.href = url;
-    const projectTitle = fieldsData['project-title'] || '제목없는_설계서';
+    const projectTitle = deriveDocumentTitle(documentData) || '제목없는_설계서';
     a.download = `${projectTitle.replace(/\s+/g, '_')}_설계서.json`;
     document.body.appendChild(a);
     a.click();
@@ -1538,93 +1944,7 @@ function handleJSONImport(e) {
     reader.onload = function(evt) {
         try {
             const importedData = JSON.parse(evt.target.result);
-            
-            if (!importedData.fields || !importedData.lessons || !importedData.roles) {
-                alert('유효하지 않은 프로젝트 설계서 JSON 파일입니다.');
-                return;
-            }
-
-            destroyAllBindings();
-
-            ydoc.transact(() => {
-                // 1. Load standard text fields
-                Object.keys(importedData.fields).forEach(syncId => {
-                    if (!sharedMap.has(syncId)) {
-                        sharedMap.set(syncId, new Y.Text());
-                    }
-                    const yText = sharedMap.get(syncId);
-                    const len = yText.length;
-                    if (len > 0) yText.delete(0, len);
-                    yText.insert(0, importedData.fields[syncId]);
-                });
-                
-                // 2. Load checkboxes
-                const checkboxes = importedData.checkboxes || {};
-                checkboxMap.forEach((_, key) => {
-                    if (!(key in checkboxes)) {
-                        checkboxMap.delete(key);
-                    }
-                });
-                Object.keys(checkboxes).forEach(key => {
-                    checkboxMap.set(key, checkboxes[key]);
-                });
-
-                // 3. Load lessons
-                const lenL = lessonsArray.length;
-                if (lenL > 0) lessonsArray.delete(0, lenL);
-                importedData.lessons.forEach(l => {
-                    const rowMap = new Y.Map();
-                    rowMap.set('id', l.id);
-                    rowMap.set('step', l.step);
-                    rowMap.set('period', l.period);
-                    
-                    const q = new Y.Text(); q.insert(0, l.question || '');
-                    const a = new Y.Text(); a.insert(0, l.activity || '');
-                    const t = new Y.Text(); t.insert(0, l.tools || '');
-                    const f = new Y.Text(); f.insert(0, l.feedback || '');
-                    
-                    rowMap.set('question', q);
-                    rowMap.set('activity', a);
-                    rowMap.set('tools', t);
-                    rowMap.set('feedback', f);
-                    
-                    lessonsArray.push([rowMap]);
-                });
-
-                // 4. Load roles
-                const lenR = rolesArray.length;
-                if (lenR > 0) rolesArray.delete(0, lenR);
-                importedData.roles.forEach(r => {
-                    const rowMap = new Y.Map();
-                    rowMap.set('id', r.id);
-                    rowMap.set('step', r.step);
-                    rowMap.set('period', r.period);
-                    
-                    const content = new Y.Text(); content.insert(0, r.content || '');
-                    const member = new Y.Text(); member.insert(0, r.member || '');
-                    
-                    rowMap.set('content', content);
-                    rowMap.set('member', member);
-                    
-                    rolesArray.push([rowMap]);
-                });
-
-                // 5. Load History
-                if (importedData.history) {
-                    const lenH = sharedHistoryArray.length;
-                    if (lenH > 0) sharedHistoryArray.delete(0, lenH);
-                    sharedHistoryArray.push(importedData.history);
-                }
-            });
-
-            // Re-bind elements
-            bindAllStaticElements();
-            renderLessonsTable();
-            renderRolesTable();
-            
-            // Trigger auto-grow
-            setTimeout(initAutoGrow, 100);
-
+            hydrateDocumentData(importedData);
             alert('프로젝트 설계서를 성공적으로 불러왔습니다!');
         } catch(err) {
             alert('JSON 파싱 오류: 올바른 파일이 아닙니다.');
@@ -1686,6 +2006,7 @@ window.addEventListener('afterprint', () => {
 function init() {
     initTheme();
     loadUserProfile();
+    initSupabaseAuth();
     
     // URL Hash Routing Setup (e.g. #doc-abcd)
     let initialRoom = window.location.hash.slice(1);
