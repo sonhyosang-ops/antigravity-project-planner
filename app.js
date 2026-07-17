@@ -1458,10 +1458,7 @@ async function connectToRoom(roomName) {
     // 3. Create fresh Y.Doc
     ydoc = new Y.Doc();
 
-    // 4. Initialize WebSocket Sync Provider
-    provider = new WebsocketProvider(WEBSOCKET_SERVER, roomName, ydoc);
-
-    // 5. Access Yjs shared types
+    // 4. Access Yjs shared types before any remote sync
     sharedMap = ydoc.getMap('project-data');
     checkboxMap = ydoc.getMap('checkbox-states');
     lessonsArray = ydoc.getArray('lessons-array');
@@ -1477,31 +1474,6 @@ async function connectToRoom(roomName) {
         rolesArray &&
         sharedHistoryArray
     );
-    
-    // Monitor WebRTC Connection Status
-    provider.on('status', event => {
-        if (!isCurrentConnection()) return;
-        if (event.status === 'connected') {
-            connectionStatus.className = 'status-connected';
-            connectionStatus.querySelector('.status-text').textContent = `공동 작업 중`;
-        } else {
-            connectionStatus.className = 'status-disconnected';
-            connectionStatus.querySelector('.status-text').textContent = '연결 보류';
-        }
-    });
-    
-    // Awareness ( 동접자 상태 ) listener
-    provider.awareness.on('change', () => {
-        if (!isCurrentConnection()) return;
-        renderActiveUsersList();
-        renderFocusedPresenceOutlines();
-    });
-    
-    // Setup Local User Profile settings in awareness immediately
-    provider.awareness.setLocalStateField('user', {
-        name: localNickname,
-        color: localColor
-    });
     
     // Setup Yjs Observe listeners
     setupObservers();
@@ -1528,6 +1500,31 @@ async function connectToRoom(roomName) {
     const titleText = sharedMap.get('project-title');
     const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
     updateRecentDoc(currentRoomId, docTitle);
+
+    // 5. Start realtime sync only after the local snapshot/default state is ready.
+    provider = new WebsocketProvider(WEBSOCKET_SERVER, roomName, ydoc);
+
+    provider.on('status', event => {
+        if (!isCurrentConnection()) return;
+        if (event.status === 'connected') {
+            connectionStatus.className = 'status-connected';
+            connectionStatus.querySelector('.status-text').textContent = `공동 작업 중`;
+        } else {
+            connectionStatus.className = 'status-disconnected';
+            connectionStatus.querySelector('.status-text').textContent = '연결 보류';
+        }
+    });
+
+    provider.awareness.on('change', () => {
+        if (!isCurrentConnection()) return;
+        renderActiveUsersList();
+        renderFocusedPresenceOutlines();
+    });
+
+    provider.awareness.setLocalStateField('user', {
+        name: localNickname,
+        color: localColor
+    });
 
     if (resolveActiveRoomReady) {
         resolveActiveRoomReady();
