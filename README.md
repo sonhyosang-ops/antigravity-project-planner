@@ -42,4 +42,5 @@
 - 인증 컨트롤러: [src/auth-controller.js](./src/auth-controller.js)
 - 문서 저장 컨트롤러: [src/document-store.js](./src/document-store.js)
 - 협업 room 컨트롤러: [src/collaboration-room.js](./src/collaboration-room.js)
+- 공동작업 참여자용 가이드: [USER_GUIDE_KO.md](./USER_GUIDE_KO.md)
 - 상세 변경 이력: [FINAL_REPORT.md](./FINAL_REPORT.md)
