@@ -431,6 +431,25 @@ function getCurrentDocumentData() {
     };
 }
 
+function applyDocumentDataToDom(importedData) {
+    const fields = importedData.fields || {};
+    document.querySelectorAll('.sync-input').forEach(element => {
+        const syncId = element.getAttribute('data-sync-id');
+        if (!syncId) return;
+        element.value = fields[syncId] || '';
+        if (element.tagName === 'TEXTAREA') {
+            autoGrowTextarea(element);
+        }
+    });
+
+    const checkboxes = importedData.checkboxes || {};
+    document.querySelectorAll('.sync-checkbox').forEach(element => {
+        const syncId = element.getAttribute('data-sync-id');
+        if (!syncId) return;
+        element.checked = !!checkboxes[syncId];
+    });
+}
+
 function hydrateDocumentData(importedData) {
     if (!importedData.fields || !importedData.lessons || !importedData.roles) {
         throw new Error('유효하지 않은 프로젝트 설계 데이터입니다.');
@@ -506,7 +525,10 @@ function hydrateDocumentData(importedData) {
     renderLessonsTable();
     renderRolesTable();
     renderHistoryList();
+    applyDocumentDataToDom(importedData);
     setTimeout(initAutoGrow, 100);
+    setTimeout(() => applyDocumentDataToDom(importedData), 0);
+    setTimeout(() => applyDocumentDataToDom(importedData), 250);
 }
 
 function documentHasMeaningfulContent(documentData) {
