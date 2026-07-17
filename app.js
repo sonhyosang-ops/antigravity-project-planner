@@ -1104,6 +1104,16 @@ function bindRowField(element, rowMap, field) {
     };
     
     element.addEventListener('input', onInput);
+
+    const onObserve = (event) => {
+        if (event.keysChanged && event.keysChanged.has(field)) {
+            const nextValue = rowMap.get(field) || '';
+            if (element.value !== nextValue) {
+                element.value = nextValue;
+            }
+        }
+    };
+    rowMap.observe(onObserve);
     
     const presenceId = `${rowMap.get('id')}-${field}`;
     const onFocus = () => {
@@ -1123,6 +1133,7 @@ function bindRowField(element, rowMap, field) {
     
     return () => {
         element.removeEventListener('input', onInput);
+        rowMap.unobserve(onObserve);
         element.removeEventListener('focus', onFocus);
         element.removeEventListener('blur', onBlur);
     };
