@@ -1,6 +1,5 @@
 import * as Y from 'https://esm.sh/yjs@13.6.10';
 import { WebsocketProvider } from 'https://esm.sh/y-websocket@3.0.0?deps=yjs@13.6.10';
-import { IndexeddbPersistence } from 'https://esm.sh/y-indexeddb@9.0.12?deps=yjs@13.6.10';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 /* ==========================================================================
@@ -8,7 +7,6 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
    ========================================================================== */
 let ydoc = null;
 let provider = null;
-let persistence = null;
 
 // Yjs Shared Types
 let sharedMap = null;         // For single inputs and settings
@@ -263,10 +261,6 @@ function disconnectCollaboration() {
     if (provider) {
         provider.destroy();
         provider = null;
-    }
-    if (persistence) {
-        persistence.destroy();
-        persistence = null;
     }
     if (ydoc) {
         ydoc.destroy();
@@ -609,6 +603,41 @@ async function findAccessibleDocumentByRoom(roomId) {
     return data;
 }
 
+async function resolveSupabaseDocumentByRoom(roomId) {
+    if (!supabase || !currentUser || !roomId) return null;
+
+    if (hasCollaborationRpc) {
+        const { data, error } = await supabase.rpc('join_document_by_room', {
+            p_room_id: roomId
+        });
+
+        if (!error) {
+            return Array.isArray(data) ? data[0] || null : data || null;
+        }
+
+        const missingRpc = /join_document_by_room|Could not find the function|PGRST202/i.test(error.message || '');
+        if (!missingRpc) {
+            setAuthMessage(`저장 문서 확인 실패: ${error.message}`, 'error');
+            return null;
+        }
+
+        hasCollaborationRpc = false;
+    }
+
+    const { data, error } = await supabase
+        .from('documents')
+        .select('id, owner_user_id, room_id, title, snapshot_json, created_at, updated_at')
+        .eq('room_id', roomId)
+        .maybeSingle();
+
+    if (error) {
+        setAuthMessage(`저장 문서 확인 실패: ${error.message}`, 'error');
+        return null;
+    }
+
+    return data;
+}
+
 async function maybeSwitchToLatestDocument() {
     if (!currentUser || !supabase) return false;
 
@@ -669,38 +698,7 @@ async function refreshCurrentRoomFromSupabase() {
 }
 
 async function resolveSupabaseDocumentForRoom() {
-    if (!supabase || !currentUser) return null;
-
-    if (hasCollaborationRpc) {
-        const { data, error } = await supabase.rpc('join_document_by_room', {
-            p_room_id: currentRoomId
-        });
-
-        if (!error) {
-            return Array.isArray(data) ? data[0] || null : data || null;
-        }
-
-        const missingRpc = /join_document_by_room|Could not find the function|PGRST202/i.test(error.message || '');
-        if (!missingRpc) {
-            setAuthMessage(`저장 문서 확인 실패: ${error.message}`, 'error');
-            return null;
-        }
-
-        hasCollaborationRpc = false;
-    }
-
-    const { data, error } = await supabase
-        .from('documents')
-        .select('id, snapshot_json')
-        .eq('room_id', currentRoomId)
-        .maybeSingle();
-
-    if (error) {
-        setAuthMessage(`저장 문서 확인 실패: ${error.message}`, 'error');
-        return null;
-    }
-
-    return data;
+    return resolveSupabaseDocumentByRoom(currentRoomId);
 }
 
 function scheduleSupabaseAutoSave() {
@@ -1434,7 +1432,7 @@ function destroyAllBindings() {
 /* ==========================================================================
    Room Connection & Engine Bootstrapping
    ========================================================================== */
-function connectToRoom(roomName) {
+async function connectToRoom(roomName) {
     if (!roomName) return;
     const connectionGeneration = ++roomConnectionGeneration;
     currentRoomId = roomName;
@@ -1449,9 +1447,6 @@ function connectToRoom(roomName) {
     if (provider) {
         provider.destroy();
     }
-    if (persistence) {
-        persistence.destroy();
-    }
     if (ydoc) {
         ydoc.destroy();
     }
@@ -1462,14 +1457,11 @@ function connectToRoom(roomName) {
     
     // 3. Create fresh Y.Doc
     ydoc = new Y.Doc();
-    
-    // 4. Initialize Local IndexedDB Persistence (Offline resilience)
-    persistence = new IndexeddbPersistence(roomName, ydoc);
-    
-    // 5. Initialize WebSocket Sync Provider (Bypasses firewalls, works reliably across networks)
+
+    // 4. Initialize WebSocket Sync Provider
     provider = new WebsocketProvider(WEBSOCKET_SERVER, roomName, ydoc);
-    
-    // 6. Access Yjs shared types
+
+    // 5. Access Yjs shared types
     sharedMap = ydoc.getMap('project-data');
     checkboxMap = ydoc.getMap('checkbox-states');
     lessonsArray = ydoc.getArray('lessons-array');
@@ -1513,41 +1505,34 @@ function connectToRoom(roomName) {
     
     // Setup Yjs Observe listeners
     setupObservers();
-    
-    // IndexedDB Local restore completion callback
-    persistence.once('synced', () => {
-        if (!isCurrentConnection()) return;
-        console.log('IndexedDB restore complete for room:', roomName);
-        
-        // Wait a short amount of time to merge possible WebRTC incoming states
-        setTimeout(() => {
-            if (!isCurrentConnection()) return;
-            if (lessonsArray.length === 0) {
-                // Completely new document, populate default lessons and roles
-                ydoc.transact(() => {
-                    initializeDefaultData();
-                });
-            }
-            
-            // Perform general rendering and binding
-            bindAllStaticElements();
-            renderLessonsTable();
-            renderRolesTable();
-            renderHistoryList();
-            
-            // Sync current doc metadata
-            const titleText = sharedMap.get('project-title');
-            const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
-            updateRecentDoc(currentRoomId, docTitle);
-            if (currentUser) {
-                bootstrapSupabaseDocumentForRoom();
-            }
-            if (resolveActiveRoomReady) {
-                resolveActiveRoomReady();
-                resolveActiveRoomReady = null;
-            }
-        }, 300);
-    });
+
+    const initialDocument = currentUser ? await resolveSupabaseDocumentByRoom(roomName) : null;
+    if (!isCurrentConnection()) return;
+
+    supabaseDocumentId = initialDocument?.id || null;
+
+    if (initialDocument?.snapshot_json) {
+        requiresSupabaseHydration = false;
+        hydrateDocumentData(initialDocument.snapshot_json);
+        setAuthMessage('Supabase 저장본을 불러왔습니다.', 'success');
+    } else {
+        ydoc.transact(() => {
+            initializeDefaultData();
+        });
+        bindAllStaticElements();
+        renderLessonsTable();
+        renderRolesTable();
+        renderHistoryList();
+    }
+
+    const titleText = sharedMap.get('project-title');
+    const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
+    updateRecentDoc(currentRoomId, docTitle);
+
+    if (resolveActiveRoomReady) {
+        resolveActiveRoomReady();
+        resolveActiveRoomReady = null;
+    }
 }
 
 function setupObservers() {
