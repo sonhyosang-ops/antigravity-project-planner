@@ -3,6 +3,24 @@ import { WebsocketProvider } from 'https://esm.sh/y-websocket@3.0.0?deps=yjs@13.
 import { WEBSOCKET_SERVER } from './app-constants.js';
 
 export function createCollaborationController(deps) {
+    function waitForInitialSync(provider, timeoutMs = 1500) {
+        return new Promise(resolve => {
+            let settled = false;
+
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve();
+            };
+
+            const timer = setTimeout(finish, timeoutMs);
+            provider.on('sync', isSynced => {
+                if (isSynced) finish();
+            });
+        });
+    }
+
     function disconnectCollaboration() {
         deps.destroyAllBindings();
         if (deps.getProvider()) {
@@ -80,27 +98,8 @@ export function createCollaborationController(deps) {
         const initialDocument = deps.getCurrentUser()
             ? await deps.resolveSupabaseDocumentByRoom(roomName)
             : null;
-        if (!isCurrentConnection()) return;
 
         deps.setSupabaseDocumentId(initialDocument?.id || null);
-
-        if (initialDocument?.snapshot_json) {
-            deps.setRequiresSupabaseHydration(false);
-            deps.hydrateDocumentData(initialDocument.snapshot_json);
-            deps.setAuthMessage('Supabase 저장본을 불러왔습니다.', 'success');
-        } else {
-            ydoc.transact(() => {
-                deps.initializeDefaultData();
-            });
-            deps.bindAllStaticElements();
-            deps.renderLessonsTable();
-            deps.renderRolesTable();
-            deps.renderHistoryList();
-        }
-
-        const titleText = deps.getSharedMap().get('project-title');
-        const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
-        deps.updateRecentDoc(deps.getCurrentRoomId(), docTitle);
 
         const provider = new WebsocketProvider(WEBSOCKET_SERVER, roomName, ydoc);
         deps.setProvider(provider);
@@ -126,6 +125,35 @@ export function createCollaborationController(deps) {
             name: deps.getLocalNickname(),
             color: deps.getLocalColor()
         });
+
+        await waitForInitialSync(provider);
+        if (!isCurrentConnection()) return;
+
+        const currentData = deps.getCurrentDocumentData();
+        const hasRemoteContent = deps.documentHasMeaningfulContent(currentData);
+
+        if (!hasRemoteContent && initialDocument?.snapshot_json) {
+            deps.setRequiresSupabaseHydration(false);
+            deps.hydrateDocumentData(initialDocument.snapshot_json);
+            deps.setAuthMessage('Supabase 저장본을 불러왔습니다.', 'success');
+        } else if (!hasRemoteContent) {
+            ydoc.transact(() => {
+                deps.initializeDefaultData();
+            });
+            deps.bindAllStaticElements();
+            deps.renderLessonsTable();
+            deps.renderRolesTable();
+            deps.renderHistoryList();
+        } else {
+            deps.bindAllStaticElements();
+            deps.renderLessonsTable();
+            deps.renderRolesTable();
+            deps.renderHistoryList();
+        }
+
+        const titleText = deps.getSharedMap().get('project-title');
+        const docTitle = titleText ? titleText.toString() : '제목 없는 프로젝트';
+        deps.updateRecentDoc(deps.getCurrentRoomId(), docTitle);
 
         const readyResolver = deps.getResolveActiveRoomReady();
         if (readyResolver) {
