@@ -85,6 +85,30 @@ body {
     flex-direction: column;
 }
 
+body.auth-required {
+    overflow: hidden;
+}
+
+body.auth-required .app-container,
+body.auth-required .collab-panel,
+body.auth-required #history-sidebar {
+    filter: blur(3px);
+    pointer-events: none;
+    user-select: none;
+}
+
+body.auth-required #dashboard-btn,
+body.auth-required #share-btn,
+body.auth-required #history-toggle-btn,
+body.auth-required #export-json-btn,
+body.auth-required #import-json-trigger,
+body.auth-required #print-btn,
+body.auth-required #push-state-btn,
+body.auth-required #user-profile-btn {
+    pointer-events: none;
+    opacity: 0.45;
+}
+
 /* ==========================================================================
    Header & Toolbar
    ========================================================================== */
@@ -238,6 +262,54 @@ body {
     background-color: var(--success-light);
     color: var(--success);
     border-color: color-mix(in srgb, var(--success) 20%, var(--border-color));
+}
+
+.auth-gate {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--bg-primary) 78%, transparent);
+    backdrop-filter: blur(8px);
+    z-index: 160;
+    padding: 1.5rem;
+}
+
+body.auth-required .auth-gate {
+    display: flex;
+}
+
+.auth-gate-card {
+    width: min(520px, 100%);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 24px;
+    box-shadow: var(--shadow-paper);
+    padding: 2rem;
+    text-align: center;
+}
+
+.auth-gate-icon {
+    width: 72px;
+    height: 72px;
+    margin: 0 auto 1rem;
+    border-radius: 999px;
+    display: grid;
+    place-items: center;
+    background: var(--primary-light);
+    color: var(--primary);
+    font-size: 1.8rem;
+}
+
+.auth-gate-card h2 {
+    font-size: 1.35rem;
+    margin-bottom: 0.65rem;
+}
+
+.auth-gate-card p {
+    color: var(--text-secondary);
+    margin-bottom: 1.25rem;
 }
 
 /* ==========================================================================
