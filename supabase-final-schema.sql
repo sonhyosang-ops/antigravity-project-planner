@@ -1,3 +1,7 @@
+-- Canonical production schema for antigravity-project-planner
+-- Apply this file when provisioning, restoring, or reconciling Supabase.
+-- Keep this file updated whenever production tables, policies, or functions change.
+
 create extension if not exists pgcrypto;
 
 create table if not exists public.documents (

@@ -1,3 +1,7 @@
+-- Legacy migration/work-in-progress SQL for collaboration setup.
+-- Do not use this as the canonical production schema.
+-- Use supabase-final-schema.sql for provisioning or restoring Supabase.
+
 create table if not exists public.document_collaborators (
   id uuid primary key default gen_random_uuid(),
   document_id uuid not null references public.documents(id) on delete cascade,
